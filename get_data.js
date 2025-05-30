@@ -165,15 +165,47 @@ async function cleanLocalFiles(remoteFiles) {
             }
         }
     }
-
-    fileIndex = fileIndex.filter(entry => remoteFiles.has(entry.path));
+     // Note: no filtering of fileIndex here — will be rebuild fully after sync to keep local files alive in index file
+     // fileIndex = fileIndex.filter(entry => remoteFiles.has(entry.path));
 }
+// NEW helper to build index from all local .hd5 files
+async function buildFullIndexFromLocal() {
+    async function getAllHd5Files(dir) {
+        const entries = await fsPromises.readdir(dir, { withFileTypes: true });
+        let allFiles = [];
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                const nestedFiles = await getAllHd5Files(fullPath);
+                allFiles = allFiles.concat(nestedFiles);
+            } else if (entry.isFile() && fullPath.endsWith('.hd5')) {
+                allFiles.push(fullPath);
+            }
+        }
+        return allFiles;
+    }
 
+    const allLocalHd5Files = await getAllHd5Files(targetDir);
+    const newIndex = allLocalHd5Files.map(fullPath => {
+        const relPath = path.relative(targetDir, fullPath);
+        const meta = extractInfoFromFilename(path.basename(fullPath));
+        return meta ? { path: relPath, ...meta } : null;
+    }).filter(Boolean);
+
+    return newIndex;
+}
 // --- Main execution ---
 async function startSync() {
     console.log(`🚀 Starting sync from ${hostURL}`);
-    const remoteFiles = await syncDirectory(hostURL, targetDir, 5, 3);
+    const remoteFiles = await syncDirectory(hostURL, targetDir, 12, 17);
     await cleanLocalFiles(remoteFiles);
+
+    //await fsPromises.writeFile(indexFilePath, JSON.stringify(fileIndex, null, 2));
+    //console.log(`✅ Sync complete. Index saved to ${indexFilePath}`);
+
+    // Instead of only using fileIndex collected during download,
+    // build an index of all files present locally:
+    fileIndex = await buildFullIndexFromLocal();
 
     await fsPromises.writeFile(indexFilePath, JSON.stringify(fileIndex, null, 2));
     console.log(`✅ Sync complete. Index saved to ${indexFilePath}`);
