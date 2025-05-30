@@ -178,7 +178,7 @@ async function buildFullIndexFromLocal() {
             if (entry.isDirectory()) {
                 const nestedFiles = await getAllHd5Files(fullPath);
                 allFiles = allFiles.concat(nestedFiles);
-            } else if (entry.isFile() && fullPath.endsWith('.hd5')) {
+            } else if (entry.isFile() && fullPath.endsWith('-hd5')) {
                 allFiles.push(fullPath);
             }
         }
