@@ -2,176 +2,183 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const cheerio = require('cheerio');
+const pLimit = require('p-limit');
+const { promisify } = require('util');
+const fsPromises = fs.promises;
 
-const hostURL = 'https://opendata.dwd.de/weather/radar/sites/pz/'; // <-- Replace with your server URL
-const targetDir = path.join(__dirname, '3D_DATA');
-const META_FILE = path.join(targetDir, 'metadata.json');
-const FILE_INDEX = path.join(targetDir, 'current_files.json');
+const hostURL = 'https://opendata.dwd.de/weather/radar/sites/pz/';
+const targetDir = path.join(__dirname, '3D_RAD_DATA');
+const indexFilePath = path.join(targetDir, 'current_files.json');
 
-// Create download directory if needed
+const HD5_FILENAME_REGEX = /_(\d+)-(\d{14})-.*?([a-zA-Z]{3})-hd5$/;
+let fileIndex = [];
+
 if (!fs.existsSync(targetDir)) {
     fs.mkdirSync(targetDir, { recursive: true });
 }
 
-// Load existing metadata
-let fileMeta = {};
-let fileListIndex = [];
-
-if (fs.existsSync(META_FILE)) {
-    fileMeta = JSON.parse(fs.readFileSync(META_FILE, 'utf-8'));
-}
-
-// --- Extract Info from Filename ---
+// --- Helpers ---
 function extractInfoFromFilename(fileName) {
-    try {
-        if (fileName.length < 30) {
-            console.warn(`Filename too short: ${fileName}`);
-            return null;
-        }
-
-        const RadID = parseInt(fileName.substring(10, 15), 10);
-        const timestamp = fileName.substring(16, 26);
-        const site = fileName.substring(27, 30);
-
-        if (isNaN(RadID)) {
-            console.warn(`Invalid RadID in ${fileName}`);
-            return null;
-        }
-
-        return { RadID, timestamp, site };
-    } catch (err) {
-        console.error(`Failed to parse filename: ${fileName}`, err.message);
-        return null;
-    }
+    const match = fileName.match(HD5_FILENAME_REGEX);
+    if (!match) return null;
+    return {
+        RadID: parseInt(match[1], 10),
+        timestamp: match[2],
+        site: match[3]
+    };
 }
 
-// --- Fetch HTML Listing ---
-function fetchDirectoryListing(url, callback) {
-    https.get(url, (res) => {
-        let html = '';
-        res.on('data', chunk => html += chunk);
-        res.on('end', () => {
-            const $ = cheerio.load(html);
-            const links = [];
+async function fetchDirectoryListing(url) {
+    return new Promise(resolve => {
+        https.get(url, res => {
+            let html = '';
+            res.on('data', chunk => html += chunk);
+            res.on('end', () => {
+                const $ = cheerio.load(html);
+                const links = [];
+                $('a').each((_, elem) => {
+                    const href = $(elem).attr('href');
+                    if (href && href !== '../') links.push(href);
+                });
+                resolve(links);
+            });
+        }).on('error', err => {
+            console.error(`❌ Failed to fetch ${url}:`, err.message);
+            resolve([]);
+        });
+    });
+}
 
-            $('a').each((_, elem) => {
-                const href = $(elem).attr('href');
-                if (href && href !== '../') {
-                    links.push(href);
+async function downloadFile(fileUrl, localPath, retries = 3) {
+    const dir = path.dirname(localPath);
+    await fsPromises.mkdir(dir, { recursive: true });
+
+    return new Promise((resolve, reject) => {
+        const tryDownload = () => {
+            const fileStream = fs.createWriteStream(localPath);
+            https.get(fileUrl, res => {
+                if (res.statusCode !== 200) {
+                    fileStream.close();
+                    fs.unlink(localPath, () => {});
+                    if (retries > 0) {
+                        console.log(`🔁 Retrying ${fileUrl} (${retries} attempts left)`);
+                        retries--;
+                        tryDownload();
+                    } else {
+                        reject(new Error(`❌ Failed to download ${fileUrl} (status ${res.statusCode})`));
+                    }
+                    return;
+                }
+                res.pipe(fileStream);
+                fileStream.on('finish', () => {
+                    fileStream.close();
+                    console.log(`⬇️  Downloaded: ${path.basename(localPath)}`);
+                    const meta = extractInfoFromFilename(path.basename(localPath));
+                    if (meta) {
+                        fileIndex.push({ path: path.relative(targetDir, localPath), ...meta });
+                    }
+                    resolve();
+                });
+            }).on('error', err => {
+                fileStream.close();
+                fs.unlink(localPath, () => {});
+                if (retries > 0) {
+                    console.log(`🔁 Retrying ${fileUrl} (${retries} attempts left): ${err.message}`);
+                    retries--;
+                    tryDownload();
+                } else {
+                    reject(err);
                 }
             });
-
-            callback(links);
-        });
-    }).on('error', err => {
-        console.error(`Failed to fetch ${url}:`, err.message);
-        callback([]);
+        };
+        tryDownload();
     });
 }
 
-// --- Check File for Update ---
-function checkFileUpdate(fileUrl, localPath, callback) {
-    const options = new URL(fileUrl);
-    options.method = 'HEAD';
+async function syncDirectory(url, localDir, concurrency = 12, folderConcurrency = 17) {
+    const links = await fetchDirectoryListing(url);
+    const dirs = links.filter(link => link.endsWith('/'));
+    const files = links.filter(link => !link.endsWith('/'));
 
-    https.request(options, res => {
-        const remoteModified = res.headers['last-modified'];
-        if (!remoteModified) {
-            console.warn(`No Last-Modified header for ${fileUrl}`);
-            return callback(false);
-        }
+    const hd5Files = files
+        .map(link => {
+            const fileName = path.basename(link);
+            const extracted = extractInfoFromFilename(fileName);
+            return extracted ? { fileName, extracted, link } : null;
+        })
+        .filter(Boolean);
 
+    const foundFiles = new Set();
+    const downloadLimiter = pLimit(concurrency);
+
+    const downloadTasks = hd5Files.map(({ fileName, link }) => {
+        const localPath = path.join(localDir, fileName);
+        const fileUrl = new URL(link, url).href;
         const relPath = path.relative(targetDir, localPath);
-        const isUpdated = !fileMeta[relPath] || fileMeta[relPath] !== remoteModified;
-        callback(isUpdated, remoteModified);
-    }).on('error', err => {
-        console.error(`HEAD error for ${fileUrl}:`, err.message);
-        callback(false);
-    }).end();
-}
+        foundFiles.add(relPath);
 
-// --- Download File ---
-function downloadFile(fileUrl, localPath, remoteModified, done) {
-    const dir = path.dirname(localPath);
-    if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-    }
-
-    const fileStream = fs.createWriteStream(localPath);
-    https.get(fileUrl, res => {
-        res.pipe(fileStream);
-        fileStream.on('finish', () => {
-            fileStream.close();
-            const relPath = path.relative(targetDir, localPath);
-            fileMeta[relPath] = remoteModified;
-            console.log(`Downloaded: ${relPath}`);
-            processFilename(localPath, relPath);
-            done();
-        });
-    }).on('error', err => {
-        console.error(`Download error for ${fileUrl}:`, err.message);
-        fs.unlink(localPath, () => {});
-        done();
+        if (!fs.existsSync(localPath)) {
+            return downloadLimiter(() => downloadFile(fileUrl, localPath));
+        }
+        return Promise.resolve();
     });
+
+    await Promise.all(downloadTasks);
+
+    // Parallel subfolder sync
+    const folderLimiter = pLimit(folderConcurrency);
+    const folderTasks = dirs.map(subdir => {
+        const newUrl = new URL(subdir, url).href;
+        const newLocal = path.join(localDir, subdir);
+        return folderLimiter(() =>
+            syncDirectory(newUrl, newLocal, concurrency, folderConcurrency)
+                .then(set => set.forEach(f => foundFiles.add(f)))
+        );
+    });
+
+    await Promise.all(folderTasks);
+    return foundFiles;
 }
 
-// --- Parse Filename for Metadata ---
-function processFilename(localPath, relPath) {
-    const fileName = path.basename(localPath);
-    const extracted = extractInfoFromFilename(fileName);
-    if (extracted) {
-        fileListIndex.push({
-            path: relPath,
-            ...extracted
-        });
-    }
-}
-
-// --- Recursive Sync ---
-function syncDirectory(url, localDir, done) {
-    fetchDirectoryListing(url, links => {
-        let pending = links.length;
-        if (pending === 0) return done();
-
-        links.forEach(link => {
-            const fullUrl = new URL(link, url).href;
-            const isDir = link.endsWith('/');
-            const localPath = path.join(localDir, decodeURIComponent(link));
-            const relPath = path.relative(targetDir, localPath);
-
-            if (isDir) {
-                syncDirectory(fullUrl, localPath, () => {
-                    pending--;
-                    if (pending === 0) done();
-                });
-            } else {
-                // Check and download if needed
-                checkFileUpdate(fullUrl, localPath, (needsUpdate, remoteModified) => {
-                    if (needsUpdate) {
-                        downloadFile(fullUrl, localPath, remoteModified, () => {
-                            pending--;
-                            if (pending === 0) done();
-                        });
-                    } else {
-                        console.log(`Up to date: ${relPath}`);
-                        processFilename(localPath, relPath); // still extract info
-                        pending--;
-                        if (pending === 0) done();
-                    }
-                });
+async function cleanLocalFiles(remoteFiles) {
+    async function getAllFiles(dir) {
+        const entries = await fsPromises.readdir(dir, { withFileTypes: true });
+        const files = await Promise.all(entries.map(async entry => {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                return getAllFiles(fullPath);
             }
-        });
-    });
+            return [path.relative(targetDir, fullPath)];
+        }));
+        return files.flat();
+    }
+
+    const localFiles = await getAllFiles(targetDir);
+    for (const file of localFiles) {
+        if (!remoteFiles.has(file)) {
+            const fullPath = path.join(targetDir, file);
+            try {
+                await fsPromises.unlink(fullPath);
+                console.log(`🗑️  Deleted: ${file}`);
+            } catch (err) {
+                console.error(`❌ Failed to delete ${file}:`, err.message);
+            }
+        }
+    }
+
+    fileIndex = fileIndex.filter(entry => remoteFiles.has(entry.path));
 }
 
-// --- Start Sync Process ---
-function startSync() {
-    syncDirectory(hostURL, targetDir, () => {
-        fs.writeFileSync(META_FILE, JSON.stringify(fileMeta, null, 2));
-        fs.writeFileSync(FILE_INDEX, JSON.stringify(fileListIndex, null, 2));
-        console.log('\n✅ Sync complete.');
-        console.log(`📄 File index saved to: ${FILE_INDEX}`);
-    });
+// --- Main execution ---
+async function startSync() {
+    console.log(`🚀 Starting sync from ${hostURL}`);
+    const remoteFiles = await syncDirectory(hostURL, targetDir, 5, 3);
+    await cleanLocalFiles(remoteFiles);
+
+    await fsPromises.writeFile(indexFilePath, JSON.stringify(fileIndex, null, 2));
+    console.log(`✅ Sync complete. Index saved to ${indexFilePath}`);
 }
 
-startSync();
+startSync().catch(err => {
+    console.error('💥 Fatal error:', err);
+});
