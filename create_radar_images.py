@@ -2,52 +2,97 @@ import h5py
 import numpy as np
 import matplotlib.pyplot as plt
 import os
+from pyproj import CRS, Transformer
 
-def load_radar_data(filepath):
-    with h5py.File(filepath, 'r') as f:
-        # --- Load raw radar data
-        raw = f["dataset1/data1/data"][:]
-        print("Raw data shape:", raw.shape)  # Expecting (levels, x, y)
+# === PARAMETERS ===
+# Radar center (decimal degrees)
+lat0 = 47.8736
+lon0 = 8.0036
 
-        # --- Attempt to extract radar location (if present)
-        lat = f["where/lat"][()] if "lat" in f["where"] else None
-        lon = f["where/lon"][()] if "lon" in f["where"] else None
+# Grid spacing in meters
+dx = dy = 1000  # 1 km
 
-    # --- Convert to float for plotting
-    data = raw.astype(np.float32)
+# Projection: Polar Stereographic
+crs_stereo = CRS(proj='stere',
+                 lat_0=lat0,
+                 lon_0=lon0,
+                 lat_ts=60,
+                 datum='WGS84')
 
-    # --- Mask common "nodata" values (0 and 65535 are common placeholders)
-    data = np.ma.masked_where((raw == 0) | (raw == 65535), data)
+# Transformer to convert from projection to lat/lon
+transformer = Transformer.from_crs(crs_stereo, CRS("EPSG:4326"), always_xy=True)
 
-    return data, lat, lon
+# === FUNCTIONS ===
 
-def plot_radar_slice(data, lat=None, lon=None):
-    # Choose center vertical level (if more than 1)
-    level = data.shape[0] // 2
-    slice2d = data[level]
+def decode_reflectivity(raw_data):
+    data = raw_data.astype(np.float32)
+    data = (data / 2.0) - 32.5
+    # Mask out invalid or noisy values
+    data = np.ma.masked_where((data < 0) | (data > 70), data)
+    return data
 
-    # Plot
-    plt.figure(figsize=(8, 7))
-    im = plt.imshow(
-        slice2d,
-        cmap="turbo",
-        origin="lower",
-        vmin=0,
-        vmax=80
-    )
-    cbar = plt.colorbar(im, label="Reflectivity (dBZ)")
-    plt.title(f"Radar Reflectivity (Level {level})" +
-              (f"\nLat: {lat:.2f}, Lon: {lon:.2f}" if lat and lon else ""))
-    plt.xlabel("X Grid Points")
-    plt.ylabel("Y Grid Points")
-    plt.tight_layout()
-    plt.show()
+def generate_latlon_grid_edges(width, height, dx=1000, dy=1000):
+    # Create center-based XY grid
+    x = (np.arange(width) - width / 2 + 0.5) * dx
+    y = (np.arange(height) - height / 2 + 0.5) * dy
 
-if __name__ == "__main__":
-    radar_file = "rab02-pz_10132-20250529110000-deboo-hd5"
+    # Now compute cell edges
+    x_edges = (np.arange(width + 1) - width / 2) * dx
+    y_edges = (np.arange(height + 1) - height / 2) * dy
+
+    X_edges, Y_edges = np.meshgrid(x_edges, y_edges)
+
+    # Project to lat/lon
+    lon_edges, lat_edges = transformer.transform(X_edges, Y_edges)
+    return lat_edges, lon_edges
+
+def plot_and_save_all_levels(data, lat_grid, lon_grid, out_dir="output_dbz"):
+    os.makedirs(out_dir, exist_ok=True)
+    n_levels = data.shape[0]
+
+    for level in range(n_levels):
+        slice2d = data[level]
+
+        plt.figure(figsize=(9, 8))
+        im = plt.pcolormesh(
+            lon_grid,
+            lat_grid,
+            slice2d,
+            cmap="turbo",
+            shading='auto',
+            vmin=-32.5,
+            vmax=40
+        )
+        plt.colorbar(im, label="Reflectivity (dBZ)")
+        plt.title(f"Decoded Reflectivity – Level {level}")
+        plt.xlabel("Longitude")
+        plt.ylabel("Latitude")
+        plt.tight_layout()
+
+        filename = os.path.join(out_dir, f"reflectivity_level_{level:02d}.png")
+        plt.savefig(filename, dpi=150)
+        plt.close()
+        print(f"✅ Saved: {filename}")
+
+def main():
+    radar_file = "rab02-pz_10908-20250604175000-defbg-hd5"  # <- Replace this with your actual file
 
     if not os.path.exists(radar_file):
         print("❌ File not found:", radar_file)
-    else:
-        data, lat, lon = load_radar_data(radar_file)
-        plot_radar_slice(data, lat=lat, lon=lon)
+        return
+
+    with h5py.File(radar_file, 'r') as f:
+        raw = f["dataset1/data1/data"][:]
+        print("📦 Raw shape:", raw.shape)
+
+    # Decode reflectivity from raw values
+    dbz = decode_reflectivity(raw)
+
+    # Create lat/lon grid
+    lat_grid, lon_grid = generate_latlon_grid_edges(width=raw.shape[2], height=raw.shape[1])
+
+    # Plot and save
+    plot_and_save_all_levels(dbz, lat_grid, lon_grid)
+
+if __name__ == "__main__":
+    main()
