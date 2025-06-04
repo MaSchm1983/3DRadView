@@ -1,65 +1,53 @@
-import os
-import json
 import h5py
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 
-# Paths (adjust as needed)
-DATA_DIR = '3D_RAD_DATA'
-OUTPUT_DIR = 'Images'
-CURRENT_FILES_JSON = os.path.join(DATA_DIR, 'current_files.json')
+def load_radar_data(filepath):
+    with h5py.File(filepath, 'r') as f:
+        # --- Load raw radar data
+        raw = f["dataset1/data1/data"][:]
+        print("Raw data shape:", raw.shape)  # Expecting (levels, x, y)
 
-# Filter site substring (or exact match)
-FILTER_SITE = 'boo'
+        # --- Attempt to extract radar location (if present)
+        lat = f["where/lat"][()] if "lat" in f["where"] else None
+        lon = f["where/lon"][()] if "lon" in f["where"] else None
 
-def load_current_files():
-    with open(CURRENT_FILES_JSON, 'r') as f:
-        return json.load(f)
+    # --- Convert to float for plotting
+    data = raw.astype(np.float32)
 
-def create_heatmap_image(data, threshold, out_path):
-    masked_data = np.ma.masked_less(data, threshold)
-    plt.figure(figsize=(8,6), dpi=100)
-    plt.imshow(masked_data, origin='lower', cmap='jet', alpha=0.7)
-    plt.axis('on')
-    plt.savefig(out_path, bbox_inches='tight', pad_inches=0)
-    plt.close()
+    # --- Mask common "nodata" values (0 and 65535 are common placeholders)
+    data = np.ma.masked_where((raw == 0) | (raw == 65535), data)
 
-def process_file(file_info):
-    file_path = os.path.join(DATA_DIR, file_info['path'])
-    timestamp = file_info['timestamp']
+    return data, lat, lon
 
-    if not os.path.isfile(file_path):
-        print(f"File not found: {file_path}")
-        return
+def plot_radar_slice(data, lat=None, lon=None):
+    # Choose center vertical level (if more than 1)
+    level = data.shape[0] // 2
+    slice2d = data[level]
 
-    with h5py.File(file_path, 'r') as f:
-        # Adjust 'reflectivity' to actual dataset name inside your hd5 file
-        dataset = f['dataset1/data1/data'][:] 
-        levels = dataset.shape[0]
-        threshold = 20
+    # Plot
+    plt.figure(figsize=(8, 7))
+    im = plt.imshow(
+        slice2d,
+        cmap="turbo",
+        origin="lower",
+        vmin=0,
+        vmax=80
+    )
+    cbar = plt.colorbar(im, label="Reflectivity (dBZ)")
+    plt.title(f"Radar Reflectivity (Level {level})" +
+              (f"\nLat: {lat:.2f}, Lon: {lon:.2f}" if lat and lon else ""))
+    plt.xlabel("X Grid Points")
+    plt.ylabel("Y Grid Points")
+    plt.tight_layout()
+    plt.show()
 
-        for lvl in range(levels):
-            data = dataset[lvl, :, :]
-            data = np.nan_to_num(data, nan=0)
+if __name__ == "__main__":
+    radar_file = "rab02-pz_10132-20250529110000-deboo-hd5"
 
-            # Prepare output dir and filename
-            site_dir = os.path.join(OUTPUT_DIR, file_info['site'])
-            os.makedirs(site_dir, exist_ok=True)
-
-            out_filename = f"{timestamp}_level{lvl}.png"
-            out_path = os.path.join(site_dir, out_filename)
-
-            create_heatmap_image(data, threshold, out_path)
-            print(f"Saved image: {out_path}")
-
-def main():
-    files = load_current_files()
-    filtered_files = [f for f in files if FILTER_SITE in f['site']]
-
-    print(f"Processing {len(filtered_files)} files for site containing '{FILTER_SITE}'...")
-
-    for file_info in filtered_files:
-        process_file(file_info)
-
-if __name__ == '__main__':
-    main()
+    if not os.path.exists(radar_file):
+        print("❌ File not found:", radar_file)
+    else:
+        data, lat, lon = load_radar_data(radar_file)
+        plot_radar_slice(data, lat=lat, lon=lon)
