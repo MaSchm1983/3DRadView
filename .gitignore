@@ -1,3 +1,10 @@
 node_modules
 3D_RAD_DATA
 Images
+test_code.py
+*-hd5
+radar_sites.txt
+show_hd5_content.py
+3d_comp_plotly.py
+brainstorming.md
+dwd_3d_composite.npy
