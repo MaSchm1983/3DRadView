@@ -1,98 +1,127 @@
 import h5py
 import numpy as np
-import matplotlib.pyplot as plt
 import os
+import json
+import matplotlib.pyplot as plt
+import contextily as ctx
 from pyproj import CRS, Transformer
 
-# === PARAMETERS ===
-# Radar center (decimal degrees)
-lat0 = 47.8736
-lon0 = 8.0036
+# === USER SETTINGS ===
+DATA_DIR = "3D_RAD_DATA"
+TARGET_TIMESTAMP = "20250805092000"  # YYYYMMDDHHMMSS
 
-# Grid spacing in meters
-dx = dy = 1000  # 1 km
+# === COMPOSITE GRID PARAMETERS ===
+COMPOSITE_N = 900
+COMPOSITE_DX = 1000  # 1 km
+COMPOSITE_PROJ = CRS(proj="stere", lat_0=90, lon_0=10, lat_ts=60,
+                     x_0=0, y_0=0, a=6370040, b=6370040, units="m", datum="WGS84")
+COMPOSITE_CENTER_LON = 9.0
+COMPOSITE_CENTER_LAT = 51.0
 
-# Projection: Polar Stereographic
-crs_stereo = CRS(proj='stere',
-                 lat_0=lat0,
-                 lon_0=lon0,
-                 lat_ts=60,
-                 datum='WGS84')
+composite_fwd = Transformer.from_crs("EPSG:4326", COMPOSITE_PROJ, always_xy=True)
+cx, cy = composite_fwd.transform(COMPOSITE_CENTER_LON, COMPOSITE_CENTER_LAT)
 
-# Transformer to convert from projection to lat/lon
-transformer = Transformer.from_crs(crs_stereo, CRS("EPSG:4326"), always_xy=True)
+# === 1. Get all files for this timestamp ===
+with open(os.path.join(DATA_DIR, "current_files.json"), "r") as f:
+    files_index = json.load(f)
 
-# === FUNCTIONS ===
+selected_files = []
+for entry in files_index:
+    relpath = entry["path"]
+    filename = os.path.basename(relpath)
+    if TARGET_TIMESTAMP in filename:
+        selected_files.append(os.path.join(DATA_DIR, relpath))
 
-def decode_reflectivity(raw_data):
-    data = raw_data.astype(np.float32)
-    data = (data / 2.0) - 32.5
-    # Mask out invalid or noisy values
-    data = np.ma.masked_where((data < 0) | (data > 70), data)
-    return data
+print(f"Found {len(selected_files)} radar files for {TARGET_TIMESTAMP}")
 
-def generate_latlon_grid_edges(width, height, dx=1000, dy=1000):
-    # Create center-based XY grid
-    x = (np.arange(width) - width / 2 + 0.5) * dx
-    y = (np.arange(height) - height / 2 + 0.5) * dy
+# === 2. Prepare composite grid ===
+composite = np.full((COMPOSITE_N, COMPOSITE_N), np.nan)
+radar_centers = []
 
-    # Now compute cell edges
-    x_edges = (np.arange(width + 1) - width / 2) * dx
-    y_edges = (np.arange(height + 1) - height / 2) * dy
+# === 3. Loop over radar files and paste them into composite grid ===
+for fname in selected_files:
+    try:
+        with h5py.File(fname, "r") as f:
+            raw = f["dataset1/data1/data"][:]
+            raw = np.flip(raw, axis=-2)  # 
+            attrs_what = f["dataset1/data1/what"].attrs
+            gain = attrs_what["gain"]
+            offset = attrs_what["offset"]
+            nodata = attrs_what["nodata"]
+            undetect = attrs_what["undetect"]
+            dbz = raw * gain + offset
+            dbz[(raw == nodata) | (raw == undetect) | (raw == 0)] = np.nan
+            dbz[dbz < 10] = np.nan  # Mask low reflectivity
+            
+            # Get radar grid size and center from /where group
+            attrs_where = f["where"].attrs
+            radar_center_lon = attrs_where.get("lon", np.nan)
+            radar_center_lat = attrs_where.get("lat", np.nan)
+            xsize = int(attrs_where.get("xsize", raw.shape[-1]))
+            ysize = int(attrs_where.get("ysize", raw.shape[-2]))
 
-    X_edges, Y_edges = np.meshgrid(x_edges, y_edges)
+            print(f"{os.path.basename(fname)}: center=({radar_center_lon},{radar_center_lat}), shape={dbz.shape}")
 
-    # Project to lat/lon
-    lon_edges, lat_edges = transformer.transform(X_edges, Y_edges)
-    return lat_edges, lon_edges
+            if (xsize != 400) or (ysize != 400):
+                print(f"⚠️ File {fname} has non-400x400 grid, skipping.")
+                continue
 
-def plot_and_save_all_levels(data, lat_grid, lon_grid, out_dir="output_dbz"):
-    os.makedirs(out_dir, exist_ok=True)
-    n_levels = data.shape[0]
+            # Save radar center for plotting
+            if not (np.isnan(radar_center_lon) or np.isnan(radar_center_lat)):
+                radar_centers.append((radar_center_lon, radar_center_lat))
 
-    for level in range(n_levels):
-        slice2d = data[level]
+            # Project radar center to composite grid X/Y
+            fwd = composite_fwd
+            radar_x, radar_y = fwd.transform(radar_center_lon, radar_center_lat)
+            ix_center = int(round((radar_x - cx) / COMPOSITE_DX + COMPOSITE_N // 2))
+            iy_center = int(round((radar_y - cy) / COMPOSITE_DX + COMPOSITE_N // 2))
 
-        plt.figure(figsize=(9, 8))
-        im = plt.pcolormesh(
-            lon_grid,
-            lat_grid,
-            slice2d,
-            cmap="turbo",
-            shading='auto',
-            vmin=-32.5,
-            vmax=40
-        )
-        plt.colorbar(im, label="Reflectivity (dBZ)")
-        plt.title(f"Decoded Reflectivity – Level {level}")
-        plt.xlabel("Longitude")
-        plt.ylabel("Latitude")
-        plt.tight_layout()
+            half = 200  # 400/2
+            ix0, ix1 = max(0, ix_center - half), min(COMPOSITE_N, ix_center + half)
+            iy0, iy1 = max(0, iy_center - half), min(COMPOSITE_N, iy_center + half)
+            rx0, rx1 = max(0, half - ix_center), 400 - max(0, ix_center + half - COMPOSITE_N)
+            ry0, ry1 = max(0, half - iy_center), 400 - max(0, iy_center + half - COMPOSITE_N)
 
-        filename = os.path.join(out_dir, f"reflectivity_level_{level:02d}.png")
-        plt.savefig(filename, dpi=150)
-        plt.close()
-        print(f"✅ Saved: {filename}")
+            if (ix1 > ix0) and (iy1 > iy0):
+                dbz_max = np.nanmax(dbz, axis=0)
+                sl_comp = composite[iy0:iy1, ix0:ix1]
+                sl_radar = dbz_max[ry0:ry1, rx0:rx1]
+                both = (~np.isnan(sl_comp)) & (~np.isnan(sl_radar))
+                only_radar = (~np.isnan(sl_radar)) & (np.isnan(sl_comp))
+                sl_comp[both] = np.maximum(sl_comp[both], sl_radar[both])
+                sl_comp[only_radar] = sl_radar[only_radar]
+                composite[iy0:iy1, ix0:ix1] = sl_comp
+            else:
+                print(f"⚠️ Skipping {fname}: indices out of bounds.")
 
-def main():
-    radar_file = "rab02-pz_10908-20250604175000-defbg-hd5"  # <- Replace this with your actual file
 
-    if not os.path.exists(radar_file):
-        print("❌ File not found:", radar_file)
-        return
+    except Exception as e:
+        print(f"❌ Error reading {fname}: {e}")
 
-    with h5py.File(radar_file, 'r') as f:
-        raw = f["dataset1/data1/data"][:]
-        print("📦 Raw shape:", raw.shape)
+# === 4. Create lat/lon grid for plotting ===
+ix = np.arange(COMPOSITE_N)
+iy = np.arange(COMPOSITE_N)
+X = cx + (ix - COMPOSITE_N // 2) * COMPOSITE_DX
+Y = cy + (iy - COMPOSITE_N // 2) * COMPOSITE_DX
+Xc, Yc = np.meshgrid(X, Y)
+composite_back = Transformer.from_crs(COMPOSITE_PROJ, "EPSG:4326", always_xy=True)
+composite_lon, composite_lat = composite_back.transform(Xc, Yc)
 
-    # Decode reflectivity from raw values
-    dbz = decode_reflectivity(raw)
+# === 5. Plot ===
+fig, ax = plt.subplots(figsize=(13, 12))
+alpha = np.where(np.isnan(composite), 0, 0.7)
+mesh = ax.pcolormesh(composite_lon, composite_lat, composite, cmap="turbo",
+                     shading="auto", vmin=20, vmax=50, alpha=alpha)
+plt.colorbar(mesh, ax=ax, label="Reflectivity (dBZ)")
+ax.set_title(f"DWD Composite Max Reflectivity {TARGET_TIMESTAMP} UTC\n>20 dBZ, radar centers as dots")
 
-    # Create lat/lon grid
-    lat_grid, lon_grid = generate_latlon_grid_edges(width=raw.shape[2], height=raw.shape[1])
+# Plot radar centers
+for lon, lat in radar_centers:
+    ax.plot(lon, lat, 'o', color='black', alpha=0.5, markersize=9, zorder=10)
 
-    # Plot and save
-    plot_and_save_all_levels(dbz, lat_grid, lon_grid)
-
-if __name__ == "__main__":
-    main()
+ctx.add_basemap(ax, crs="EPSG:4326", source=ctx.providers.OpenStreetMap.Mapnik)
+ax.set_xlabel("Longitude")
+ax.set_ylabel("Latitude")
+plt.tight_layout()
+plt.savefig(f"composite_osm_{TARGET_TIMESTAMP}_simple.png", dpi=180)
+plt.show()
